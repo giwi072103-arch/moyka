@@ -1,0 +1,11 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wash
+      POSTGRES_PASSWORD: wash
+      POSTGRES_DB: wash
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["wash_data:/var/lib/postgresql/data"]
+volumes:
+  wash_data:

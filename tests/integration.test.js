@@ -1,0 +1,64 @@
+import {test,before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {PGlite} from '@electric-sql/pglite';
+import request from 'supertest';
+import {readFile} from 'node:fs/promises';
+import {createApp} from '../server/app.js';
+import {signed} from './helpers.js';
+let db,app,client,other,washer,admin,car,service,order;
+const origin='http://localhost:5173';
+const send=(agent,method,url,body)=>agent[method]('/api'+url).set('Origin',origin).send(body);
+before(async()=>{
+ db=new PGlite();await db.exec(await readFile(new URL('../server/schema.sql',import.meta.url),'utf8'));
+ const adapter={query:(...args)=>db.query(...args),connect:async()=>({query:(...args)=>db.query(...args),release(){}})};
+ app=createApp(adapter,{APP_URL:origin,BOT_TOKEN:'test-token',ADMIN_TELEGRAM_IDS:'999',NODE_ENV:'test',CARD_ENCRYPTION_KEY:'ab'.repeat(32)});
+ client=request.agent(app);other=request.agent(app);washer=request.agent(app);admin=request.agent(app);
+ for(const [agent,id,name] of [[client,100,'Client'],[other,200,'Other'],[washer,300,'Washer'],[admin,999,'Admin']]){
+  await send(agent,'post','/auth/telegram',{initData:signed({id,first_name:name})}).expect(200);
+  await send(agent,'patch','/me',{phone:'+998901234567'}).expect(200);
+ }
+});
+after(async()=>{await db.close()});
+test('complete booking lifecycle, prices, authorization and audit',async()=>{
+ await send(client,'post','/admin/services',{}).expect(403);
+ service=(await send(admin,'post','/admin/services',{name:'Комплекс',description:'Кузов и салон',category:'Комплексы',price:70000,duration:50,active:true}).expect(201)).body;
+ car=(await send(client,'post','/cars',{brand:'Cobalt',plate:'80 A 123 AA'}).expect(201)).body;
+ await send(client,'post','/cars',{brand:'Cobalt',plate:'invalid'}).expect(400);
+ await send(other,'post','/orders',{car_id:car.id,service_id:service.id}).expect(400);
+ order=(await send(client,'post','/orders',{car_id:car.id,service_id:service.id,price:1}).expect(201)).body;
+ assert.equal(order.price,70000);
+ await send(client,'post','/orders',{car_id:car.id,service_id:service.id}).expect(409);
+ await other.get(`/api/orders/${order.id}/messages`).expect(403);
+ await send(other,'post',`/orders/${order.id}/messages`,{body:'intrusion'}).expect(403);
+ await send(client,'patch',`/orders/${order.id}/status`,{status:'ready'}).expect(403);
+ await send(washer,'post','/washer/apply',{full_name:'Test Washer',phone:'+998901234567'}).expect(201);
+ await send(washer,'patch',`/orders/${order.id}/status`,{status:'accepted'}).expect(403);
+ const w=(await washer.get('/api/me')).body.user;
+ await send(admin,'patch',`/admin/washers/${w.id}`,{status:'approved'}).expect(200);
+ await send(washer,'patch',`/orders/${order.id}/status`,{status:'accepted'}).expect(409);
+ await send(washer,'patch','/washer/availability',{available:true}).expect(200);
+ await send(washer,'patch',`/orders/${order.id}/status`,{status:'accepted'}).expect(200);
+ await send(washer,'patch',`/orders/${order.id}/status`,{status:'completed'}).expect(409);
+ await send(admin,'patch',`/admin/washers/${w.id}`,{status:'rejected'}).expect(409);
+ await send(washer,'post',`/orders/${order.id}/messages`,{body:'Добрый день!'}).expect(201);
+ assert.equal((await client.get(`/api/orders/${order.id}/messages`)).body.length,1);
+ await send(admin,'put',`/admin/services/${service.id}`,{name:'Комплекс',description:'Кузов и салон',category:'Комплексы',price:90000,duration:50,active:true}).expect(200);
+ assert.equal((await client.get('/api/orders')).body[0].price,70000);
+ for(const status of ['washing','ready','completed'])await send(washer,'patch',`/orders/${order.id}/status`,{status}).expect(200);
+ await send(client,'post',`/orders/${order.id}/messages`,{body:'closed'}).expect(409);
+ await send(client,'post',`/orders/${order.id}/review`,{rating:5,review:'Отлично'}).expect(200);
+ await send(other,'post',`/orders/${order.id}/review`,{rating:1}).expect(403);
+ await send(admin,'patch',`/admin/orders/${order.id}/payment`,{paid:true}).expect(200);
+ const overview=(await admin.get('/api/admin/overview')).body;assert.equal(overview.revenue,'70000');assert.equal(overview.active,0);
+ assert.ok((await admin.get('/api/admin/audit')).body.length>=7);
+});
+test('sessions, CSRF protection, block and logout',async()=>{
+ await client.post('/api/cars').send({brand:'x',plate:'80 A 000 AA'}).expect(403);
+ await request(app).get('/api/me').expect(401);
+ const user=(await other.get('/api/me')).body.user;
+ await send(admin,'patch',`/admin/users/${user.id}`,{blocked:true}).expect(200);
+ await other.get('/api/me').expect(401);
+ await send(other,'post','/auth/telegram',{initData:signed({id:200,first_name:'Other'})}).expect(403);
+ await send(client,'post','/auth/logout',{}).expect(200);
+ await client.get('/api/me').expect(401);
+});
